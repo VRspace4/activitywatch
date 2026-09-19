@@ -107,7 +107,7 @@ function build_setup() {
     else
         env AW_VERSION=$version_no_prefix "$innosetupdir/iscc.exe" scripts/package/activitywatch-setup.iss
     fi
-    mv dist/activitywatch-setup.exe dist/$filename
+    "$SCRIPT_DIR/collect-setup.sh" "$filename"
     echo "Setup built!"
 }
 
@@ -121,4 +121,3 @@ echo "-------------------------------------"
 echo "Contents of ./dist"
 ls -l dist
 echo "-------------------------------------"
-

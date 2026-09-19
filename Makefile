@@ -7,7 +7,7 @@
 #
 # We recommend creating and activating a Python virtualenv before building.
 # Instructions on how to do this can be found in the guide linked above.
-.PHONY: build install test clean clean_all
+.PHONY: build install test clean clean_all update-submodules sync-tauri-server
 
 SHELL := /usr/bin/env bash
 
@@ -104,6 +104,17 @@ update:
 	git submodule update --init --recursive
 	make build
 
+# Move direct submodules to their latest upstream commits. aw-tauri's lockfile
+# is authoritative for the server revision, so align the top-level server
+# submodule with it after updating everything else.
+update-submodules:
+	git submodule update --init --remote
+	git submodule foreach 'git submodule update --init --recursive'
+	$(MAKE) sync-tauri-server
+
+sync-tauri-server:
+	python3 scripts/check_tauri_server.py --sync
+
 
 lint:
 	@for module in $(LINTABLES); do \
@@ -171,19 +182,23 @@ aw-qt/media/logo/logo.icns:
 	rm -R build/MyIcon.iconset
 	mv build/MyIcon.icns aw-qt/media/logo/logo.icns
 
-dist/ActivityWatch.app: aw-qt/media/logo/logo.icns
+# Stem of the macOS .app / .dmg. Research Edition patches APP_BUNDLE so the
+# on-disk bundle does not collide with /Applications/ActivityWatch.app.
+APP_BUNDLE ?= ActivityWatch
+
+dist/$(APP_BUNDLE).app: aw-qt/media/logo/logo.icns
 ifeq ($(TAURI_BUILD),true)
 	scripts/package/build_app_tauri.sh
 else
 	pyinstaller --clean --noconfirm aw.spec
 endif
 
-dist/ActivityWatch.dmg: dist/ActivityWatch.app
+dist/$(APP_BUNDLE).dmg: dist/$(APP_BUNDLE).app
 	# NOTE: This does not codesign the dmg, that is done in the CI config
 	pip install dmgbuild
 	@for attempt in 1 2 3; do \
-		rm -f dist/ActivityWatch.dmg; \
-		if dmgbuild -s scripts/package/dmgbuild-settings.py -D app=dist/ActivityWatch.app "ActivityWatch" dist/ActivityWatch.dmg; then \
+		rm -f dist/$(APP_BUNDLE).dmg; \
+		if dmgbuild -s scripts/package/dmgbuild-settings.py -D app=dist/$(APP_BUNDLE).app "$(APP_BUNDLE)" dist/$(APP_BUNDLE).dmg; then \
 			exit 0; \
 		fi; \
 		if [ $$attempt -eq 3 ]; then \

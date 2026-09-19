@@ -9,9 +9,23 @@ name: Release
 
 on:
   schedule:
+    # Weekly dev prerelease (goes through preflight/create-tag).
     - cron: '0 12 * * 4'
+    # Nightly integration build: every submodule moved to its upstream
+    # master, build + test, nothing committed or published. Skipped when
+    # no submodule moved since the pinned tree. Identified below via
+    # github.event.schedule == '0 3 * * *'.
+    - cron: '0 3 * * *'
   workflow_dispatch:
     inputs:
+      submodules:
+        description: 'pinned = build the committed submodule pointers; latest = move every submodule to its upstream master first (nothing is committed)'
+        required: false
+        type: choice
+        options:
+          - pinned
+          - latest
+        default: pinned
       release_line:
         description: 'Release line to prerelease from'
         required: true
@@ -43,7 +57,11 @@ permissions:
 jobs:
   preflight:
     name: Pre-flight checks
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Never mint a dev release from the nightly cron or from a dispatch that
+    # moved submodules off their pinned pointers.
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule != '0 3 * * *')
+      || (github.event_name == 'workflow_dispatch' && inputs.submodules != 'latest')
     runs-on: ubuntu-latest
     concurrency:
       group: dev-release
@@ -162,7 +180,10 @@ jobs:
             --jq '.check_suite_id' 2>/dev/null || echo "0")
 
           # Auxiliary workflow jobs are not CI signals; exclude them so their
-          # skipped or failed conclusions do not block the release.
+          # skipped or failed conclusions do not block the release. Nightly
+          # latest-submodule builds run against the same master SHA and are
+          # named "… [latest submodules]": a red nightly says nothing about
+          # the pinned tree that a dev release ships, so they are excluded too.
           conclusions=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${head_sha}/check-runs" \
             --paginate \
             --slurp 2>/dev/null | jq -r --arg suite "$current_suite_id" '
@@ -170,7 +191,8 @@ jobs:
                | select(
                    .app.slug == "github-actions" and
                    ((.check_suite.id | tostring) != $suite) and
-                   (.name | test("^(Dependabot|Auto-merge|greeting|Pre-flight checks|Create dev release tag)$") | not)
+                   (.name | test("^(Dependabot|Auto-merge|greeting|Pre-flight checks|Create dev release tag|Resolve latest submodule tips \\(nightly\\))$") | not) and
+                   (.name | test("\\[latest submodules\\]") | not)
                  )
                | .conclusion]
               | unique
@@ -252,15 +274,203 @@ jobs:
             echo "The tag-triggered build jobs in this workflow will now build artifacts and create/update the draft prerelease."
           } >> "$GITHUB_STEP_SUMMARY"
 
+  nightly-submodules:
+    # Only runs in latest mode: the nightly cron or `submodules=latest`.
+    # Resolves every submodule, recursively, to its upstream master and
+    # reports whether anything moved relative to the committed pointers.
+    # Build jobs check out exactly these SHAs so every leg tests the same
+    # tips even when they start minutes apart. Nothing is committed.
+    #
+    # On every other trigger this job is skipped, so ordinary pushes, PRs and
+    # release tags do not queue a runner to do nothing. Its dependents carry
+    # `!cancelled()` so a skipped dependency does not cascade into skipping
+    # them, and they read its outputs as empty, which their conditions and
+    # `name:` expressions already treat as pinned mode.
+    name: Resolve latest submodule tips (nightly)
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '0 3 * * *')
+      || inputs.submodules == 'latest'
+    runs-on: ubuntu-latest
+    outputs:
+      latest: ${{ steps.resolve.outputs.latest }}
+      moved: ${{ steps.resolve.outputs.moved }}
+      shas: ${{ steps.resolve.outputs.shas }}
+    steps:
+      # No submodules here: on ordinary pushes and PRs this job exits at the
+      # guard below, and a recursive submodule clone would be paid for nothing
+      # on every build. Submodules are initialised only in latest mode.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Resolve submodule tips
+        id: resolve
+        env:
+          LATEST: ${{ (github.event_name == 'schedule' && github.event.schedule == '0 3 * * *') || inputs.submodules == 'latest' }}
+        run: |
+          set -euo pipefail
+          if [ "$LATEST" != "true" ]; then
+            { echo "latest=false"; echo "moved=false"; echo "shas="; } >> "$GITHUB_OUTPUT"
+            echo "Pinned submodule build; nothing to resolve."
+            exit 0
+          fi
+          git submodule update --init --recursive --depth 1 2>&1 | tail -3
+          # Single quotes are deliberate: `git submodule foreach` expands
+          # $displaypath itself, once per submodule.
+          # shellcheck disable=SC2016
+          tips='echo "$(git rev-parse HEAD) $displaypath"'
+          before=$(git submodule foreach --recursive --quiet "$tips")
+          # Build the first-party submodule list by URL, not by name: a
+          # submodule is first-party iff its URL is under
+          # github.com/ActivityWatch/ (case-insensitive). Third-party
+          # submodules are excluded from --remote so unreviewed code is
+          # never executed in jobs that carry signing secrets.
+          firstparty=""
+          excluded=""
+          # Read name/path pairs straight from .gitmodules: the section name
+          # (needed for the "submodule.<name>.url" lookup) is not guaranteed
+          # to equal the path, so deriving the name from $sm_path would risk
+          # a silent empty-URL lookup for any submodule where they differ.
+          while read -r key path; do
+            [ -z "$path" ] && continue
+            name="${key#submodule.}"
+            name="${name%.path}"
+            url=$(git config -f .gitmodules --get "submodule.$name.url" 2>/dev/null || true)
+            # Anchored (no leading *) so only an actual github.com/ActivityWatch/
+            # host+org prefix matches — a URL merely containing that string
+            # later in the path (e.g. a mirror) does not.
+            case "${url,,}" in
+              https://github.com/activitywatch/*|http://github.com/activitywatch/*|git@github.com:activitywatch/*|ssh://git@github.com/activitywatch/*)
+                firstparty="${firstparty:+$firstparty }$path" ;;
+              *) excluded="${excluded:+$excluded }$path" ;;
+            esac
+          done < <(git config -f .gitmodules --get-regexp '^submodule\..*\.path$')
+          # Print the excluded set every run so the boundary stays visible.
+          if [ -n "$excluded" ]; then
+            echo "Third-party submodules (excluded from --remote, kept at pinned revision): $excluded"
+          fi
+          # An empty list would drop the `--` argument and move *every*
+          # submodule, including third-party; refuse instead.
+          if [ -z "$firstparty" ]; then echo "no first-party submodules to move" >&2; exit 1; fi
+          # shellcheck disable=SC2086
+          git submodule update --init --recursive --remote --depth 1 -- $firstparty 2>&1 | tail -20
+          after=$(git submodule foreach --recursive --quiet "$tips")
+          if [ "$before" = "$after" ]; then
+            moved=false
+            echo "All submodules already at their upstream tips; nightly build skipped."
+          else
+            moved=true
+            echo "Submodules moved:"
+            diff <(echo "$before") <(echo "$after") | sed 's/^/  /' || true
+          fi
+          {
+            echo "latest=true"
+            echo "moved=$moved"
+            echo "shas<<EOF"
+            echo "$after"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Nightly submodule tips"
+            echo '```'
+            echo "$after"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  research-edition-checks:
+    name: Research Edition — patch and packaging smoke tests${{ needs.nightly-submodules.outputs.latest == 'true' && ' [latest submodules]' || '' }}
+    # Run on every PR and push so drifted submodule pins fail at review time,
+    # not when Erik pushes the annotated release tag.  The patcher is stdlib-only
+    # so no poetry/build step is needed; only submodules (real source files) and
+    # pytest (for the unit-test fixture suite).
+    needs: nightly-submodules
+    # Normal triggers as before; additionally the nightly cron, but only when
+    # a submodule actually moved off its committed pointer.
+    if: >-
+      !cancelled()
+      && contains(fromJSON('["success", "skipped"]'), needs.nightly-submodules.result)
+      && (github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+      || (needs.nightly-submodules.outputs.latest == 'true' && needs.nightly-submodules.outputs.moved == 'true'))
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: 'recursive'
+          fetch-depth: 1
+
+      - name: Use latest submodule tips (nightly / submodules=latest)
+        if: needs.nightly-submodules.outputs.latest == 'true'
+        env:
+          SUBMODULE_SHAS: ${{ needs.nightly-submodules.outputs.shas }}
+        run: |
+          set -euo pipefail
+          # Two passes: direct submodules first, then initialise whatever
+          # nested submodules the moved parents declare (a new parent revision
+          # may introduce one that the pinned checkout never had), then nested.
+          pass() {
+            printf '%s\n' "$SUBMODULE_SHAS" | while read -r sha path; do
+              [ -n "$path" ] || continue
+              case "$1" in
+                direct) case "$path" in */*) continue ;; esac ;;
+                nested) case "$path" in */*) ;; *) continue ;; esac ;;
+              esac
+              git -C "$path" fetch -q --depth 1 origin "$sha"
+              git -C "$path" checkout -q "$sha"
+            done
+          }
+          pass direct
+          # Initialise nested submodules from *inside* each direct submodule:
+          # a top-level `git submodule update --recursive` would check out
+          # the superproject-recorded (pinned) revisions and undo pass direct.
+          git submodule --quiet foreach 'git submodule update --init --recursive -q'
+          pass nested
+          git submodule status --recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.9'
+
+      - name: Install pytest
+        run: pip install pytest
+
+      # Verify every patch target string exists exactly once in the real
+      # submodule sources for both build flavours.  Fails immediately if a
+      # target is missing or ambiguous — the same guard that would abort a tag
+      # build, now running at PR time.
+      - name: Verify Qt patch targets (--check)
+        run: python3 scripts/patch_research_edition_profile.py qt --check
+
+      - name: Verify Tauri patch targets (--check)
+        run: python3 scripts/patch_research_edition_profile.py tauri --check
+
+      # Fixture-based unit tests: patchers apply correctly on synthetic trees,
+      # fail closed on missing/ambiguous tokens, and leave ordinary defaults
+      # untouched on the unpatched tree. Also exercise the Windows installer
+      # collection step with fixture .exe files named by the real patched .iss
+      # sources; this catches naming drift without Inno Setup or signing.
+      - name: Run profile patcher and installer collection tests
+        run: python3 -m pytest scripts/tests/test_patch_research_edition_profile.py -q
+
+      - name: Test updater channel isolation and release versions
+        run: python3 -m pytest scripts/tests/test_generate_latest_json.py scripts/tests/test_configure_tauri_release.py -q
+
   build-qt:
-    name: Build Qt artifacts
-    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    name: Build Qt artifacts (${{ matrix.os }}${{ (matrix.research || (github.event_name == 'workflow_dispatch' && inputs.edition == 'research') || endsWith(github.ref_name, '-research')) && ', research' || '' }})${{ needs.nightly-submodules.outputs.latest == 'true' && ' [latest submodules]' || '' }}
+    needs: nightly-submodules
+    # Normal triggers as before; additionally the nightly cron, but only when
+    # a submodule actually moved off its committed pointer.
+    if: >-
+      !cancelled()
+      && contains(fromJSON('["success", "skipped"]'), needs.nightly-submodules.result)
+      && (github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+      || (needs.nightly-submodules.outputs.latest == 'true' && needs.nightly-submodules.outputs.moved == 'true'))
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.experimental }}
     env:
       AW_EXTRAS: true
       MACOSX_DEPLOYMENT_TARGET: "12.0"
-      AW_RESEARCH_EDITION: ${{ (github.event_name == 'workflow_dispatch' && inputs.edition == 'research') || endsWith(github.ref_name, '-research') }}
+      AW_RESEARCH_EDITION: ${{ matrix.research || (github.event_name == 'workflow_dispatch' && inputs.edition == 'research') || endsWith(github.ref_name, '-research') }}
     defaults:
       run:
         shell: bash
@@ -275,12 +485,58 @@ jobs:
         skip_rust: [false]
         skip_webui: [false]
         experimental: [false]
+        # Research Edition build leg: apply the research patch set and
+        # compile/test/package the *patched* tree on every PR and branch push,
+        # so a drifted patch target or a patched-source compile failure dies at
+        # PR time instead of at tag time. Linux only: cheapest full build and no
+        # signing secrets. On tag pushes and research dispatches `research`
+        # resolves to false, so this row merges into the existing ubuntu-22.04 row
+        # instead of adding a duplicate leg -- research tags already build the
+        # research edition in every row, and standard tags must not upload
+        # research artifacts to the standard release.
+        research: [false]
+        include:
+          - os: ubuntu-22.04
+            python_version: 3.9
+            node_version: 22
+            skip_rust: false
+            skip_webui: false
+            experimental: false
+            research: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')) }}
 
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: 'recursive'
           fetch-depth: 0
+
+      - name: Use latest submodule tips (nightly / submodules=latest)
+        if: needs.nightly-submodules.outputs.latest == 'true'
+        env:
+          SUBMODULE_SHAS: ${{ needs.nightly-submodules.outputs.shas }}
+        run: |
+          set -euo pipefail
+          # Two passes: direct submodules first, then initialise whatever
+          # nested submodules the moved parents declare (a new parent revision
+          # may introduce one that the pinned checkout never had), then nested.
+          pass() {
+            printf '%s\n' "$SUBMODULE_SHAS" | while read -r sha path; do
+              [ -n "$path" ] || continue
+              case "$1" in
+                direct) case "$path" in */*) continue ;; esac ;;
+                nested) case "$path" in */*) ;; *) continue ;; esac ;;
+              esac
+              git -C "$path" fetch -q origin "$sha"
+              git -C "$path" checkout -q "$sha"
+            done
+          }
+          pass direct
+          # Initialise nested submodules from *inside* each direct submodule:
+          # a top-level `git submodule update --recursive` would check out
+          # the superproject-recorded (pinned) revisions and undo pass direct.
+          git submodule --quiet foreach 'git submodule update --init --recursive -q'
+          pass nested
+          git submodule status --recursive
 
       - name: Set RELEASE
         run: |
@@ -356,7 +612,7 @@ jobs:
 
       - name: Set up Node
         if: ${{ !matrix.skip_webui }}
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node_version }}
 
@@ -418,7 +674,11 @@ jobs:
 
       - name: Patch research edition defaults
         if: env.AW_RESEARCH_EDITION == 'true'
-        run: python3 scripts/patch_research_edition_config.py aw-watcher-window/aw_watcher_window/config.py
+        run: |
+          python3 scripts/patch_research_edition_config.py aw-watcher-window/aw_watcher_window/config.py
+          # Participants' machines must resume tracking after reboots without
+          # setup steps: enable start-at-login on first launch (aw-qt#131).
+          python3 scripts/patch_research_edition_awqt.py aw-qt/aw_qt/config.py
 
       # Watchers store buckets as `{client}_{hostname}`. That hostname is a
       # participant identifier on named machines, and /api/0/export copies it
@@ -428,11 +688,9 @@ jobs:
         if: env.AW_RESEARCH_EDITION == 'true'
         run: python3 scripts/patch_research_edition_export.py
 
-      # The watcher rewrites `app` to a study category before storing, but
-      # aw-webui categorises client-side with its own defaults and never sees
-      # the watcher's map -- so without this the Categories panel reads
-      # "Uncategorized" while Top Applications shows the right categories.
-      # Derived from the same map as the step above, so the two cannot drift.
+      # The watcher keeps approved app names and replaces browser titles with a
+      # study category. This preset maps both representations into the study
+      # taxonomy so Top Applications and Top Categories agree.
       - name: Emit research edition category preset for the web UI
         if: env.AW_RESEARCH_EDITION == 'true'
         shell: bash
@@ -458,6 +716,32 @@ jobs:
         run: |
           source venv/bin/activate || source venv/Scripts/activate
           make test-integration
+
+      # The patcher's exact-match table is release-critical. Run it on every
+      # PR/release job (not only research tags) so a drifted submodule pin
+      # fails before packaging. Must stay on the unpatched tree: --check
+      # and the fail-closed tests assert the ordinary defaults.
+      - name: Test research edition profile patcher
+        run: |
+          source venv/bin/activate || source venv/Scripts/activate
+          python3 -m pytest scripts/tests/test_patch_research_edition_profile.py -q
+
+      # Research Edition profile identity is baked AFTER the module test
+      # suites: they assert the ordinary defaults (profile=default, port 5600)
+      # and would fail on the patched tree. Python modules are editable
+      # installs, so PyInstaller collects the patched source at package time;
+      # the Rust binaries are rebuilt below. Fail-closed: a stale submodule pin
+      # aborts the build rather than shipping a bundle that runs the default
+      # profile next to a participant's standard install.
+      - name: Patch research edition profile identity
+        if: env.AW_RESEARCH_EDITION == 'true'
+        run: python3 scripts/patch_research_edition_profile.py qt
+
+      - name: Rebuild aw-server-rust with research defaults
+        if: env.AW_RESEARCH_EDITION == 'true' && matrix.skip_rust != true
+        run: |
+          source venv/bin/activate || source venv/Scripts/activate
+          make --directory=aw-server-rust aw-server SKIP_WEBUI=true
 
       - name: Package
         run: |
@@ -489,21 +773,26 @@ jobs:
             export APPLE_PERSONALID
           fi
 
+          BUNDLE="ActivityWatch"
+          if [[ "$AW_RESEARCH_EDITION" == "true" ]]; then
+            BUNDLE="ActivityWatch-Research"
+          fi
+
           source venv/bin/activate
-          make dist/ActivityWatch.dmg
+          make "dist/${BUNDLE}.dmg" APP_BUNDLE="${BUNDLE}"
 
           if [ "$SIGN_MACOS" = true ]; then
-            codesign --force --verbose --timestamp -s "${APPLE_PERSONALID}" dist/ActivityWatch.dmg
+            codesign --force --verbose --timestamp -s "${APPLE_PERSONALID}" "dist/${BUNDLE}.dmg"
 
             brew install akeru-inc/tap/xcnotary
-            xcnotary precheck dist/ActivityWatch.app
-            xcnotary precheck dist/ActivityWatch.dmg
+            xcnotary precheck "dist/${BUNDLE}.app"
+            xcnotary precheck "dist/${BUNDLE}.dmg"
 
             make dist/notarize
           fi
           EDITION=""
           if [[ "$AW_RESEARCH_EDITION" == "true" ]]; then EDITION="-research"; fi
-          mv dist/ActivityWatch.dmg dist/activitywatch${EDITION}-${VERSION_WITH_V}-macos-$(uname -m).dmg
+          mv "dist/${BUNDLE}.dmg" dist/activitywatch${EDITION}-${VERSION_WITH_V}-macos-$(uname -m).dmg
         env:
           APPLE_EMAIL: ${{ secrets.APPLE_EMAIL }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
@@ -523,12 +812,19 @@ jobs:
       - name: Upload packages
         uses: actions/upload-artifact@v7
         with:
-          name: builds-${{ matrix.os }}-py${{ matrix.python_version }}
+          name: builds-${{ matrix.os }}-py${{ matrix.python_version }}${{ matrix.research && '-research' || '' }}
           path: dist/activitywatch-*.*
 
   build-qt-manylinux-2-28:
-    name: Build Qt artifacts (manylinux_2_28 — glibc 2.28 ABI floor)
-    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    name: Build Qt artifacts (manylinux_2_28 — glibc 2.28 ABI floor${{ ((github.event_name == 'workflow_dispatch' && inputs.edition == 'research') || endsWith(github.ref_name, '-research')) && ', research' || '' }})${{ needs.nightly-submodules.outputs.latest == 'true' && ' [latest submodules]' || '' }}
+    needs: nightly-submodules
+    # Normal triggers as before; additionally the nightly cron, but only when
+    # a submodule actually moved off its committed pointer.
+    if: >-
+      !cancelled()
+      && contains(fromJSON('["success", "skipped"]'), needs.nightly-submodules.result)
+      && (github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+      || (needs.nightly-submodules.outputs.latest == 'true' && needs.nightly-submodules.outputs.moved == 'true'))
     runs-on: ubuntu-22.04
     container:
       image: quay.io/pypa/manylinux_2_28_x86_64
@@ -562,6 +858,40 @@ jobs:
       # the version probe to fall back to v0.0.0.dev-unknown.
       - name: Configure git safe directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Use latest submodule tips (nightly / submodules=latest)
+        if: needs.nightly-submodules.outputs.latest == 'true'
+        env:
+          # The container runs as root over a runner-owned checkout; the
+          # global safe.directory above covers the workspace only, not the
+          # submodule worktrees this step runs git inside of. Step-scoped.
+          GIT_CONFIG_COUNT: 1
+          GIT_CONFIG_KEY_0: safe.directory
+          GIT_CONFIG_VALUE_0: '*'
+          SUBMODULE_SHAS: ${{ needs.nightly-submodules.outputs.shas }}
+        run: |
+          set -euo pipefail
+          # Two passes: direct submodules first, then initialise whatever
+          # nested submodules the moved parents declare (a new parent revision
+          # may introduce one that the pinned checkout never had), then nested.
+          pass() {
+            printf '%s\n' "$SUBMODULE_SHAS" | while read -r sha path; do
+              [ -n "$path" ] || continue
+              case "$1" in
+                direct) case "$path" in */*) continue ;; esac ;;
+                nested) case "$path" in */*) ;; *) continue ;; esac ;;
+              esac
+              git -C "$path" fetch -q origin "$sha"
+              git -C "$path" checkout -q "$sha"
+            done
+          }
+          pass direct
+          # Initialise nested submodules from *inside* each direct submodule:
+          # a top-level `git submodule update --recursive` would check out
+          # the superproject-recorded (pinned) revisions and undo pass direct.
+          git submodule --quiet foreach 'git submodule update --init --recursive -q'
+          pass nested
+          git submodule status --recursive
 
       - name: Set RELEASE
         run: |
@@ -630,7 +960,7 @@ jobs:
           echo "OK: aw-server version ${BUNDLED_VERSION} is consistent with AW release ${AW_VERSION}"
 
       - name: Set up Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node_version }}
 
@@ -699,7 +1029,15 @@ jobs:
 
       - name: Patch research edition defaults
         if: env.AW_RESEARCH_EDITION == 'true'
-        run: python3 scripts/patch_research_edition_config.py aw-watcher-window/aw_watcher_window/config.py
+        run: |
+          python3 scripts/patch_research_edition_config.py aw-watcher-window/aw_watcher_window/config.py
+          # Participants' machines must resume tracking after reboots without
+          # setup steps: enable start-at-login on first launch (aw-qt#131).
+          python3 scripts/patch_research_edition_awqt.py aw-qt/aw_qt/config.py
+
+      - name: Patch research edition export hostname sanitizer
+        if: env.AW_RESEARCH_EDITION == 'true'
+        run: python3 scripts/patch_research_edition_export.py
 
       - name: Emit research edition category preset for the web UI
         if: env.AW_RESEARCH_EDITION == 'true'
@@ -724,6 +1062,32 @@ jobs:
         run: |
           source venv/bin/activate
           make test-integration
+
+      # The patcher's exact-match table is release-critical. Run it on every
+      # PR/release job (not only research tags) so a drifted submodule pin
+      # fails before packaging. Must stay on the unpatched tree: --check
+      # and the fail-closed tests assert the ordinary defaults.
+      - name: Test research edition profile patcher
+        run: |
+          source venv/bin/activate
+          python3 -m pytest scripts/tests/test_patch_research_edition_profile.py -q
+
+      # Research Edition profile identity is baked AFTER the module test
+      # suites: they assert the ordinary defaults (profile=default, port 5600)
+      # and would fail on the patched tree. Python modules are editable
+      # installs, so PyInstaller collects the patched source at package time;
+      # the Rust binaries are rebuilt below. Fail-closed: a stale submodule pin
+      # aborts the build rather than shipping a bundle that runs the default
+      # profile next to a participant's standard install.
+      - name: Patch research edition profile identity
+        if: env.AW_RESEARCH_EDITION == 'true'
+        run: python3 scripts/patch_research_edition_profile.py qt
+
+      - name: Rebuild aw-server-rust with research defaults
+        if: env.AW_RESEARCH_EDITION == 'true'
+        run: |
+          source venv/bin/activate
+          make --directory=aw-server-rust aw-server SKIP_WEBUI=true
 
       - name: Package
         run: |
@@ -760,15 +1124,22 @@ jobs:
           path: dist/activitywatch-*.*
 
   build-tauri:
-    name: Build Tauri artifacts
-    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    name: Build Tauri artifacts (${{ matrix.os }}${{ (matrix.research || (github.event_name == 'workflow_dispatch' && inputs.edition == 'research') || endsWith(github.ref_name, '-research')) && ', research' || '' }})${{ needs.nightly-submodules.outputs.latest == 'true' && ' [latest submodules]' || '' }}
+    needs: nightly-submodules
+    # Normal triggers as before; additionally the nightly cron, but only when
+    # a submodule actually moved off its committed pointer.
+    if: >-
+      !cancelled()
+      && contains(fromJSON('["success", "skipped"]'), needs.nightly-submodules.result)
+      && (github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+      || (needs.nightly-submodules.outputs.latest == 'true' && needs.nightly-submodules.outputs.moved == 'true'))
     runs-on: ${{ matrix.os }}
     continue-on-error: ${{ matrix.experimental }}
     env:
       AW_EXTRAS: true
       TAURI_BUILD: true
       MACOSX_DEPLOYMENT_TARGET: "12.0"
-      AW_RESEARCH_EDITION: ${{ (github.event_name == 'workflow_dispatch' && inputs.edition == 'research') || endsWith(github.ref_name, '-research') }}
+      AW_RESEARCH_EDITION: ${{ matrix.research || (github.event_name == 'workflow_dispatch' && inputs.edition == 'research') || endsWith(github.ref_name, '-research') }}
       # All subprojects share one virtualenv. Poetry's parallel installer can
       # race while replacing the same dependency from different lock files.
       POETRY_INSTALLER_PARALLEL: "false"
@@ -792,12 +1163,58 @@ jobs:
         skip_rust: [false]
         skip_webui: [false]
         experimental: [false]
+        # Research Edition build leg: apply the research patch set and
+        # compile/test/package the *patched* tree on every PR and branch push,
+        # so a drifted patch target or a patched-source compile failure dies at
+        # PR time instead of at tag time. Linux only: cheapest full build and no
+        # signing secrets. On tag pushes and research dispatches `research`
+        # resolves to false, so this row merges into the existing ubuntu-24.04 row
+        # instead of adding a duplicate leg -- research tags already build the
+        # research edition in every row, and standard tags must not upload
+        # research artifacts to the standard release.
+        research: [false]
+        include:
+          - os: ubuntu-24.04
+            python_version: 3.9
+            node_version: 22
+            skip_rust: false
+            skip_webui: false
+            experimental: false
+            research: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')) }}
 
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: "recursive"
           fetch-depth: 0
+
+      - name: Use latest submodule tips (nightly / submodules=latest)
+        if: needs.nightly-submodules.outputs.latest == 'true'
+        env:
+          SUBMODULE_SHAS: ${{ needs.nightly-submodules.outputs.shas }}
+        run: |
+          set -euo pipefail
+          # Two passes: direct submodules first, then initialise whatever
+          # nested submodules the moved parents declare (a new parent revision
+          # may introduce one that the pinned checkout never had), then nested.
+          pass() {
+            printf '%s\n' "$SUBMODULE_SHAS" | while read -r sha path; do
+              [ -n "$path" ] || continue
+              case "$1" in
+                direct) case "$path" in */*) continue ;; esac ;;
+                nested) case "$path" in */*) ;; *) continue ;; esac ;;
+              esac
+              git -C "$path" fetch -q origin "$sha"
+              git -C "$path" checkout -q "$sha"
+            done
+          }
+          pass direct
+          # Initialise nested submodules from *inside* each direct submodule:
+          # a top-level `git submodule update --recursive` would check out
+          # the superproject-recorded (pinned) revisions and undo pass direct.
+          git submodule --quiet foreach 'git submodule update --init --recursive -q'
+          pass nested
+          git submodule status --recursive
 
       - name: Set environment variables
         run: |
@@ -828,53 +1245,40 @@ jobs:
           echo "Version (no v):     ${VERSION_NO_V}"
           echo "========================================"
 
-      - name: Verify aw-server-rust submodule version matches release tag
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          # Fail fast if the aw-server-rust submodule is pinned to an older
-          # release line than the one we're tagging. The Windows 0.14 Tauri
-          # bundle shipped with aw-server-rust v0.13.1 (activitywatch#1380);
-          # catch the same class of mismatch here before spending ~30 min on a
-          # full Tauri build.
-          #
-          # The bundled binary's version lives in
-          # aw-server-rust/aw-server/Cargo.toml (the workspace-level
-          # aw-server-rust/Cargo.toml has no [package].version field).
-          BUNDLED_VERSION=$(grep -m1 '^version = ' aw-server-rust/aw-server/Cargo.toml | sed -E 's/^version = "(.*)".*/\1/')
-          if [ -z "$BUNDLED_VERSION" ]; then
-            echo "ERROR: could not read aw-server version from aw-server-rust/aw-server/Cargo.toml" >&2
-            exit 1
-          fi
-
-          AW_VERSION="${VERSION_NO_V}"  # e.g. "0.14.0b3"
-          if [ -z "$AW_VERSION" ]; then
-            echo "ERROR: VERSION_NO_V is empty — the 'Determine and output version' step must export it to GITHUB_ENV" >&2
-            exit 1
-          fi
-          AW_MAJOR_MINOR=$(echo "$AW_VERSION" | cut -d'.' -f1-2)  # "0.14"
-          AWS_MAJOR_MINOR=$(echo "$BUNDLED_VERSION" | cut -d'.' -f1-2)  # "0.14"
-
-          echo "AW release tag:       ${AW_VERSION} (major.minor: ${AW_MAJOR_MINOR})"
-          echo "Bundled aw-server:    ${BUNDLED_VERSION} (major.minor: ${AWS_MAJOR_MINOR})"
-
-          if [ "$AW_MAJOR_MINOR" != "$AWS_MAJOR_MINOR" ]; then
-            echo ""
-            echo "ERROR: aw-server-rust major.minor (${AWS_MAJOR_MINOR}) does not match"
-            echo "       AW release major.minor (${AW_MAJOR_MINOR})."
-            echo "       The aw-server-rust submodule is stale for this tag."
-            echo "       Update the submodule (cd aw-server-rust && git pull) and re-tag."
-            exit 1
-          fi
-          echo "OK: aw-server version ${BUNDLED_VERSION} is consistent with AW release ${AW_VERSION}"
-
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python_version }}
 
+      # On a nightly the aw-server-rust submodule has moved but aw-tauri's
+      # Cargo.lock still pins the old revision; relock it so Tauri really builds
+      # the latest server and the verification below still holds. Needs cargo,
+      # which this job only installs later, so install stable here too. The
+      # `toolchain` input is required by dtolnay/rust-toolchain; re-installing a
+      # toolchain that is already present is a no-op.
+      - name: Set up Rust for the nightly relock
+        if: needs.nightly-submodules.outputs.latest == 'true'
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+
+      - name: Relock aw-tauri Cargo.lock to the latest aw-server-rust (nightly)
+        if: needs.nightly-submodules.outputs.latest == 'true'
+        run: |
+          set -euo pipefail
+          sha=$(git -C aw-server-rust rev-parse HEAD)
+          (cd aw-tauri/src-tauri && cargo update -p aw-server --precise "$sha")
+          git -C aw-tauri diff --stat -- src-tauri/Cargo.lock
+
+      - name: Verify Tauri and Qt embed the same aw-server-rust revision
+        # Tauri embeds the Git revision in its Cargo.lock, independently of
+        # the top-level submodule used by Qt. Check the actual build inputs;
+        # checking only the submodule allowed v0.14.0b4 Tauri to ship 0.13.1.
+        run: python3 scripts/check_tauri_server.py "$VERSION_NO_V"
+
       - name: Set up Node
         if: ${{ !matrix.skip_webui }}
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node_version }}
 
@@ -947,17 +1351,36 @@ jobs:
         if: env.AW_RESEARCH_EDITION == 'true'
         run: python3 scripts/patch_research_edition_export.py
 
-      # The watcher rewrites `app` to a study category before storing, but
-      # aw-webui categorises client-side with its own defaults and never sees
-      # the watcher's map -- so without this the Categories panel reads
-      # "Uncategorized" while Top Applications shows the right categories.
-      # Derived from the same map as the step above, so the two cannot drift.
+      # The watcher keeps approved app names and replaces browser titles with a
+      # study category. This preset maps both representations into the study
+      # taxonomy so Top Applications and Top Categories agree.
       - name: Emit research edition category preset for the web UI
         if: env.AW_RESEARCH_EDITION == 'true'
         shell: bash
         run: |
           preset="$(python3 scripts/emit_research_category_preset.py)"
           echo "AW_PRESET_CATEGORY_SETS=${preset}" >> "$GITHUB_ENV"
+
+      # aw-tauri/Makefile enables bundle.createUpdaterArtifacts through a CLI
+      # --config override when TAURI_SIGNING_PRIVATE_KEY is set. The JSON file
+      # alone therefore does not describe whether signed bundles are produced.
+      - name: Configure Tauri release version and update channel
+        run: |
+          args=()
+          if [ "$AW_RESEARCH_EDITION" = true ]; then
+            args+=(--research)
+            if [[ "$GITHUB_REF" == refs/tags/v* || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+              args+=(--require-signing-key)
+            fi
+          fi
+          python3 scripts/package/configure_tauri_release.py \
+            --config aw-tauri/src-tauri/tauri.conf.json \
+            --version "$VERSION_NO_V" "${args[@]}"
+        env:
+          TAURI_UPDATER_PUBLIC_KEY_RESEARCH: ${{ vars.TAURI_UPDATER_PUBLIC_KEY_RESEARCH }}
+          # Select the secret NAME, never `research_secret || standard_secret`:
+          # an absent research secret must not fall back to standard signing.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets[env.AW_RESEARCH_EDITION == 'true' && 'TAURI_SIGNING_PRIVATE_KEY_RESEARCH' || 'TAURI_SIGNING_PRIVATE_KEY'] }}
 
       - name: Build
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4
@@ -973,10 +1396,9 @@ jobs:
             make build SKIP_WEBUI=${{ matrix.skip_webui }} SKIP_SERVER_RUST=${{ matrix.skip_rust }}
             pip freeze
         env:
-          # Signs aw-tauri bundles and emits .sig files for the updater when
-          # createUpdaterArtifacts is enabled in aw-tauri/src-tauri/tauri.conf.json.
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # aw-tauri/Makefile enables createUpdaterArtifacts when this key is set.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets[env.AW_RESEARCH_EDITION == 'true' && 'TAURI_SIGNING_PRIVATE_KEY_RESEARCH' || 'TAURI_SIGNING_PRIVATE_KEY'] }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets[env.AW_RESEARCH_EDITION == 'true' && 'TAURI_SIGNING_PRIVATE_KEY_PASSWORD_RESEARCH' || 'TAURI_SIGNING_PRIVATE_KEY_PASSWORD'] }}
 
       - name: Run tests
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4
@@ -987,6 +1409,41 @@ jobs:
           command: |
             source venv/bin/activate || source venv/Scripts/activate
             make test SKIP_SERVER_RUST=${{ matrix.skip_rust }}
+
+      # The patcher's exact-match table is release-critical. Run it on every
+      # PR/release job (not only research tags) so a drifted submodule pin
+      # fails before packaging. Must stay on the unpatched tree: --check
+      # and the fail-closed tests assert the ordinary defaults.
+      - name: Test research edition profile patcher
+        run: |
+          source venv/bin/activate || source venv/Scripts/activate
+          python3 -m pytest scripts/tests/test_patch_research_edition_profile.py -q
+
+      # Research Edition profile identity is baked AFTER the module test
+      # suites: they assert the ordinary defaults (profile=default, port 5600)
+      # and would fail on the patched tree. Python modules are editable
+      # installs, so PyInstaller collects the patched source at package time;
+      # the Rust binaries are rebuilt below. Fail-closed: a stale submodule pin
+      # aborts the build rather than shipping a bundle that runs the default
+      # profile next to a participant's standard install.
+      - name: Patch research edition profile identity
+        if: env.AW_RESEARCH_EDITION == 'true'
+        run: python3 scripts/patch_research_edition_profile.py tauri
+
+      - name: Rebuild aw-tauri with research defaults
+        if: env.AW_RESEARCH_EDITION == 'true'
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4
+        with:
+          timeout_minutes: 60
+          max_attempts: 3
+          shell: bash
+          command: |
+            set -e
+            source venv/bin/activate || source venv/Scripts/activate
+            make --directory=aw-tauri build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets[env.AW_RESEARCH_EDITION == 'true' && 'TAURI_SIGNING_PRIVATE_KEY_RESEARCH' || 'TAURI_SIGNING_PRIVATE_KEY'] }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets[env.AW_RESEARCH_EDITION == 'true' && 'TAURI_SIGNING_PRIVATE_KEY_PASSWORD_RESEARCH' || 'TAURI_SIGNING_PRIVATE_KEY_PASSWORD'] }}
 
       - name: Import macOS signing certificate
         if: runner.os == 'macOS' && (startsWith(github.ref, 'refs/tags/v') || env.AW_RESEARCH_EDITION == 'true')
@@ -1045,21 +1502,26 @@ jobs:
             SIGN_MACOS=true
           fi
 
+          BUNDLE="ActivityWatch"
+          if [[ "$AW_RESEARCH_EDITION" == "true" ]]; then
+            BUNDLE="ActivityWatch-Research"
+          fi
+
           source venv/bin/activate
-          make dist/ActivityWatch.dmg
+          make "dist/${BUNDLE}.dmg" APP_BUNDLE="${BUNDLE}"
 
           if [ "$SIGN_MACOS" = true ]; then
-            codesign --force --verbose --timestamp -s "${APPLE_PERSONALID}" dist/ActivityWatch.dmg
+            codesign --force --verbose --timestamp -s "${APPLE_PERSONALID}" "dist/${BUNDLE}.dmg"
 
             brew install akeru-inc/tap/xcnotary
-            xcnotary precheck dist/ActivityWatch.app
-            xcnotary precheck dist/ActivityWatch.dmg
+            xcnotary precheck "dist/${BUNDLE}.app"
+            xcnotary precheck "dist/${BUNDLE}.dmg"
 
             make dist/notarize
           fi
           EDITION=""
           if [[ "$AW_RESEARCH_EDITION" == "true" ]]; then EDITION="-research"; fi
-          mv dist/ActivityWatch.dmg dist/activitywatch-tauri${EDITION}-${VERSION_WITH_V}-macos-$(uname -m).dmg
+          mv "dist/${BUNDLE}.dmg" dist/activitywatch-tauri${EDITION}-${VERSION_WITH_V}-macos-$(uname -m).dmg
         env:
           APPLE_EMAIL: ${{ secrets.APPLE_EMAIL }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
@@ -1122,7 +1584,7 @@ jobs:
       - name: Upload packages
         uses: actions/upload-artifact@v7
         with:
-          name: builds-tauri-${{ matrix.os }}-py${{ matrix.python_version }}
+          name: builds-tauri-${{ matrix.os }}-py${{ matrix.python_version }}${{ matrix.research && '-research' || '' }}
           path: |
             dist/activitywatch-*.*
             dist/updater/*
@@ -1199,13 +1661,27 @@ jobs:
           # filenames, which do not exist on research releases (research
           # artifacts carry a -research token). Point at the asset
           # list instead of linking to 404s.
+          #
+          # Download lines come in two forms: a linked bold label
+          # (` - [**Windows**](url) ...`) or a plain bold label followed by
+          # per-arch links (` - **macOS**: [Intel](url) | ... `) — both must
+          # be stripped, on both the Classic and Tauri sections, or the
+          # plain-label form survives and keeps pointing at nonexistent
+          # standard-edition filenames.
           python3 - <<'PY'
           import re
 
           path = "release_notes.md"
           notes = open(path).read()
           notes = re.sub(
-              r"(?m)^ - \[\*\*(Windows|macOS|Linux)\*\*\]\([^)]*\)[^\n]*\n?",
+              r"(?m)^ - (?:\[\*\*(?:Windows|macOS|Linux)\*\*\]\([^)]*\)|\*\*(?:Windows|macOS|Linux)\*\*:)[^\n]*\n?",
+              "",
+              notes,
+          )
+          # Distribution sub-headings (Classic/Tauri) have no content left
+          # once their download lines are stripped above.
+          notes = re.sub(
+              r"(?m)^## (?:Classic|Tauri) distribution[^\n]*\n(?:\n)*",
               "",
               notes,
           )
@@ -1254,8 +1730,8 @@ jobs:
       # are set by Actions) rather than interpolated into the shell script, so
       # a crafted v* tag cannot inject commands into this contents-write job.
       #
-      # Editions are partitioned by filename so they cannot share an updater
-      # endpoint: standard writes latest.json, research writes latest-research.json.
+      # Keep versioned release assets separate. Research clients use the
+      # independent research-updates branch; these assets do not publish that feed.
       - name: Generate updater manifest
         run: |
           set -euo pipefail
